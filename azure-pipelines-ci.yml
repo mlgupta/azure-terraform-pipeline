@@ -1,0 +1,195 @@
+name: Terraform-CI-Pipeline
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+pool: Default
+
+variables:
+  - name: environment
+    value: dev
+  - group: terraform-var-group
+
+stages:
+- stage: DetectChanges
+  jobs:
+  - job: IdentifyChangedWorkspaces
+    steps:
+    - checkout: self
+      fetchDepth: 0
+      
+    - bash: |
+        # Get changed files between the last two commits
+        changed_files=$(git diff --name-only HEAD^ HEAD)
+
+        # Use an associative array to track unique environment/workspace combinations.
+        declare -A workspace_set
+
+        # Flag to indicate if any workspace is affected
+        has_workspace='false'
+
+        # Process changed files to detect direct workspace changes.
+        # This will match paths like: environments/<env>/workspaces/<workspace>/...
+        while IFS= read -r file; do
+          if [[ "$file" =~ ^environments/([^/]+)/workspaces/([^/]+)/ ]]; then
+            env="${BASH_REMATCH[1]}"
+            ws="${BASH_REMATCH[2]}"
+            key="${env}/${ws}"
+            # Insert into associative array; duplicate keys will be overwritten
+            workspace_set["$key"]="$env:$ws"
+            has_workspace='true'
+          fi
+        done <<< "$changed_files"
+
+        # If any file under modules/ changed, check all workspaces for module references.
+        if echo "$changed_files" | grep -q "^modules/"; then
+          # Loop through each environment folder
+          for env_dir in environments/*; do
+            if [ -d "$env_dir" ]; then
+              # Loop through each workspace within the environment
+              for ws_dir in "$env_dir"/workspaces/*; do
+                if [ -d "$ws_dir" ] && [ -f "$ws_dir/main.tf" ]; then
+                  # If the workspace's main.tf references a module from modules/
+                  if grep -q "module.*source.*modules/" "$ws_dir/main.tf"; then
+                    env=$(basename "$env_dir")
+                    ws=$(basename "$ws_dir")
+                    key="${env}/${ws}"
+                    workspace_set["$key"]="$env:$ws"
+                    has_workspace='true'
+                  fi
+                fi
+              done
+            fi
+          done
+        fi
+
+        # Build the JSON object using only the unique keys from the associative array.
+        json_object="{"
+        first=true
+        for key in "${!workspace_set[@]}"; do
+          if [ "$first" = true ]; then
+            first=false
+          else
+            json_object="$json_object,"
+          fi
+          # Split the stored value (format "env:workspace") into separate variables.
+          IFS=":" read env ws <<< "${workspace_set[$key]}"
+          json_object="$json_object\"$key\":{\"environment\":\"$env\",\"workspace\":\"$ws\"}"
+        done
+        json_object="$json_object}"
+
+        # Set Azure DevOps variables using logging commands.
+        echo "##vso[task.setvariable variable=HAS_WORKSPACE;isOutput=true]$has_workspace"
+        echo "##vso[task.setvariable variable=WORKSPACE_MATRIX;isOutput=true]$json_object"
+
+        # Log the JSON and flag.
+        echo "$json_object"
+        echo "Has workspace: $has_workspace"
+      name: detectChanges
+
+- stage: Validate
+  dependsOn: DetectChanges
+  condition: eq(dependencies.DetectChanges.outputs['IdentifyChangedWorkspaces.detectChanges.HAS_WORKSPACE'], 'true')
+  jobs:
+  - job: Validate_Workspaces
+    variables:
+      - name: matrix
+        value: $[ stageDependencies.DetectChanges.IdentifyChangedWorkspaces.outputs['detectChanges.WORKSPACE_MATRIX'] ]
+    strategy:
+      matrix: ${{ variables.matrix }}
+    steps:
+    - bash: |
+        echo "Environment: $(environment)"
+        echo "Workspace: $(workspace)"
+      displayName: 'Print Environment and Workspace'
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: 'latest'
+    - task: TerraformTaskV3@3
+      name: terraformInit
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: 'environments/$(environment)/workspaces/$(workspace)'
+        backendServiceArm: '$(environment)-service-connection'
+        backendAzureRmResourceGroupName: 'terraform-state-rg'
+        backendAzureRmStorageAccountName: 'dbstfstate$(environment)'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'terraform.tfstate'
+    - task: TerraformTaskV3@3
+      name: terraformSelectWorkspace
+      inputs:
+        provider: 'azurerm'
+        command: 'custom'
+        customCommand: 'workspace'
+        commandOptions: 'select $(workspace)'
+        workingDirectory: 'environments/$(environment)/workspaces/$(workspace)'
+        environmentServiceNameAzureRM: '$(environment)-service-connection'
+    - task: TerraformTaskV3@3
+      name: terraformValidate
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+
+- stage: Plan
+  dependsOn: 
+  - DetectChanges
+  - Validate
+  condition: and(succeeded(),eq(dependencies.DetectChanges.outputs['IdentifyChangedWorkspaces.detectChanges.HAS_WORKSPACE'], 'true'))
+  jobs:
+  - job: Plan_Workspaces
+    variables:
+      - name: matrix
+        value: $[ stageDependencies.DetectChanges.IdentifyChangedWorkspaces.outputs['detectChanges.WORKSPACE_MATRIX'] ]
+    strategy:
+      matrix: ${{ variables.matrix }}
+    steps:
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: 'latest'
+    - task: TerraformTaskV3@3
+      name: terraformInit
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: 'environments/$(environment)/workspaces/$(workspace)'
+        backendServiceArm: '$(environment)-service-connection'
+        backendAzureRmResourceGroupName: 'terraform-state-rg'
+        backendAzureRmStorageAccountName: 'dbstfstate$(environment)'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'terraform.tfstate'
+    - task: TerraformTaskV3@3
+      name: terraformSelectWorkspace
+      inputs:
+        provider: 'azurerm'
+        command: 'custom'
+        customCommand: 'workspace'
+        commandOptions: 'select $(workspace)'
+        workingDirectory: 'environments/$(environment)/workspaces/$(workspace)'
+        environmentServiceNameAzureRM: '$(environment)-service-connection'
+    - task: TerraformTaskV3@3
+      name: terraformPlan
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: 'environments/$(environment)/workspaces/$(workspace)'
+        environmentServiceNameAzureRM: '$(environment)-service-connection'
+        publishPlanResults: '$(workspace)-plan'
+
+- stage: Approval
+  displayName: 'Manual Approval'
+  pool: server
+  condition: always()
+  jobs:
+  - job: WaitForApproval
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: |
+          user@company.com
+        instructions: 'Please validate the merge for $(environment) before proceeding with the deployment.'
+        onTimeout: 'reject'
